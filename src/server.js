@@ -896,6 +896,13 @@ io.on('connection', async socket => {
       if (Number(wallet.chips) < buyin) return ack({ ok: false, error: 'NOT_ENOUGH_CHIPS' });
 
       const snapshot = await tableSnapshot(tableId);
+
+      // PUBLIC BETA SAFETY: temporarily cap each poker table at 2 real players.
+      // 3+ player all-in/side-pot flow is still under active testing.
+      if ((snapshot.seats || []).length >= 2) {
+        return ack({ ok: false, error: 'BETA_TABLE_LIMIT' });
+      }
+
       const used = new Set(snapshot.seats.map(s => Number(s.seat_no)));
       let seatNo = null;
       for (let i = 0; i < table.max_seats; i++) {
@@ -1035,7 +1042,7 @@ io.on('connection', async socket => {
   });
 });
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'atr-poker', phase: '1.6.2-leave-after-hand' }));
+app.get('/health', (_, res) => res.json({ ok: true, service: 'atr-poker', phase: '1.6.2-public-beta-2p' }));
 
 server.listen(PORT, () => {
   console.log(`ATR Poker backend listening on :${PORT}`);
