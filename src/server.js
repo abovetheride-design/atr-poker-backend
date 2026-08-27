@@ -941,6 +941,58 @@ io.on('connection', async socket => {
     }
   });
 
+  socket.on('poker:table:rebuy', async (payload = {}, ack = () => {}) => {
+    try {
+      const tableId=socket.data.tableId;
+      if(!tableId)return ack({ok:false,error:'NOT_SEATED'});
+      const hand=liveHands.get(tableId);
+      if(hand && !hand.completed)return ack({ok:false,error:'HAND_IN_PROGRESS'});
+
+      const {data:seat,error:seatError}=await db.from('poker_seats')
+        .select('*').eq('table_id',tableId).eq('user_id',user.id).maybeSingle();
+      if(seatError)throw seatError;
+      if(!seat)return ack({ok:false,error:'NOT_SEATED'});
+      if(Number(seat.stack)>0)return ack({ok:false,error:'STACK_NOT_ZERO'});
+
+      const {data:table,error:tableError}=await db.from('poker_tables')
+        .select('*').eq('id',tableId).eq('enabled',true).single();
+      if(tableError)throw tableError;
+
+      const requested=Math.floor(Number(payload.buyin||0));
+      const buyin=requested||Number(table.max_buyin);
+      if(buyin<Number(table.min_buyin)||buyin>Number(table.max_buyin))
+        return ack({ok:false,error:'INVALID_BUYIN'});
+
+      const wallet=await ensureWallet(user.id);
+      if(Number(wallet.chips)<buyin)
+        return ack({ok:false,error:'NOT_ENOUGH_CHIPS',wallet:Number(wallet.chips)});
+
+      const newBalance=Number(wallet.chips)-buyin;
+      const {error:walletError}=await db.from('poker_wallets')
+        .update({chips:newBalance,updated_at:new Date().toISOString()}).eq('user_id',user.id);
+      if(walletError)throw walletError;
+
+      const {error:stackError}=await db.from('poker_seats')
+        .update({stack:buyin}).eq('table_id',tableId).eq('user_id',user.id).eq('stack',0);
+      if(stackError){
+        await db.from('poker_wallets')
+          .update({chips:wallet.chips,updated_at:new Date().toISOString()}).eq('user_id',user.id);
+        throw stackError;
+      }
+
+      const fresh=await tableSnapshot(tableId);
+      io.to(TABLE_ROOM(tableId)).emit('poker:table:state',fresh);
+      io.emit('poker:lobby:changed');
+      ack({ok:true,buyin,wallet:newBalance,state:fresh});
+
+      if(!liveHands.has(tableId) && fresh.seats.filter(s=>Number(s.stack)>0).length>=2)
+        scheduleServerHand(tableId,400);
+    }catch(error){
+      console.error('ATR Poker rebuy:',error);
+      ack({ok:false,error:error.message||'REBUY_FAILED'});
+    }
+  });
+
   socket.on('poker:table:leave-after-hand', async (payload = {}, ack = () => {}) => {
     const enabled=payload?.enabled!==false;
     const userId=socket.data.user.id;
@@ -1041,7 +1093,7 @@ io.on('connection', async socket => {
   });
 });
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'atr-poker', phase: '1.6.3-allin-response-fix' }));
+app.get('/health', (_, res) => res.json({ ok: true, service: 'atr-poker', phase: '1.6.4-server-rebuy-fix' }));
 
 server.listen(PORT, () => {
   console.log(`ATR Poker backend listening on :${PORT}`);
