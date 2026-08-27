@@ -558,6 +558,8 @@ async function finishServerHandWithPayouts(hand,payouts,winnerIds,summaries){
     try{
       const current=liveHands.get(hand.tableId);
       if(current===hand)liveHands.delete(hand.tableId);
+
+      await processLeaveAfterHand(hand.tableId);
       const fresh=await tableSnapshot(hand.tableId);
       io.to(TABLE_ROOM(hand.tableId)).emit('poker:table:state',fresh);
       scheduleServerHand(hand.tableId,400);
@@ -889,7 +891,7 @@ io.on('connection', async socket => {
         });
         await sendCurrentHandToSocket(socket, tableId);
         if (!liveHands.has(tableId) && fresh.seats.length >= 2) {
-          scheduleServerHand(tableId);
+          scheduleServerHand(tableId,2500);
         }
         return;
       }
@@ -934,7 +936,7 @@ io.on('connection', async socket => {
       ack({ ok: true, seatNo, wallet: newBalance, state: fresh });
 
       if (fresh.seats.length >= 2) {
-        scheduleServerHand(tableId);
+        scheduleServerHand(tableId,2500);
       }
     } catch (error) {
       ack({ ok: false, error: error.message });
@@ -1093,7 +1095,7 @@ io.on('connection', async socket => {
   });
 });
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'atr-poker', phase: '1.6.4-server-rebuy-fix' }));
+app.get('/health', (_, res) => res.json({ ok: true, service: 'atr-poker', phase: '1.6.5-3player-sidepot-beta' }));
 
 server.listen(PORT, () => {
   console.log(`ATR Poker backend listening on :${PORT}`);
