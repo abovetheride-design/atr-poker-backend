@@ -326,10 +326,11 @@ function canActPlayers(hand){return hand.players.filter(p=>!p.folded&&!p.allIn);
 function bySeat(hand,s){return hand.players.find(p=>p.seatNo===s);}
 function nextCanAct(hand,from){return nextOccupiedSeat(canActPlayers(hand).map(p=>p.seatNo),from);}
 function roundDone(hand){
-  const a=canActPlayers(hand);
-  if(a.length<=1)return true;
-  if(!a.every(p=>p.streetBet===hand.currentBet))return false;
-  return a.every(p=>hand.actedThisStreet.has(p.userId));
+  const actors=canActPlayers(hand);
+  // Never close the betting round while a player who can still act owes a call.
+  if(actors.some(p=>p.streetBet<hand.currentBet))return false;
+  if(actors.length<=1)return true;
+  return actors.every(p=>hand.actedThisStreet.has(p.userId));
 }
 function nextStreet(s){return s==='preflop'?'flop':s==='flop'?'turn':s==='turn'?'river':'showdown';}
 function dealStreet(hand,s){
@@ -585,8 +586,13 @@ async function advanceServerStreet(hand){
   if(livePlayers(hand).length===1)return finishServerHand(hand,[livePlayers(hand)[0].userId],'FOLD');
   if(hand.street==='river')return serverShowdown(hand);
   const s=nextStreet(hand.street); dealStreet(hand,s); hand.street=s; hand.currentBet=0; hand.players.forEach(p=>p.streetBet=0); hand.actedThisStreet=new Set();
-  if(canActPlayers(hand).length<=1)return serverShowdown(hand);
-  hand.turnSeatNo=nextOccupiedSeat(canActPlayers(hand).map(p=>p.seatNo),hand.dealerSeatNo);
+  const actors=canActPlayers(hand);
+  if(actors.length===0)return serverShowdown(hand);
+  if(actors.length===1){
+    const lone=actors[0];
+    if(lone.streetBet===hand.currentBet)return serverShowdown(hand);
+  }
+  hand.turnSeatNo=nextOccupiedSeat(actors.map(p=>p.seatNo),hand.dealerSeatNo);
   hand.lastAction=s.toUpperCase();
   armTurnTimer(hand);
   emitHandState(hand);
@@ -1035,7 +1041,7 @@ io.on('connection', async socket => {
   });
 });
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'atr-poker', phase: '1.6.2-leave-after-hand' }));
+app.get('/health', (_, res) => res.json({ ok: true, service: 'atr-poker', phase: '1.6.3-allin-response-fix' }));
 
 server.listen(PORT, () => {
   console.log(`ATR Poker backend listening on :${PORT}`);
