@@ -49,8 +49,11 @@ const turnTimers = new Map();
 const leaveAfterHandUsers = new Set();
 const disconnectTimers = new Map();
 const disconnectLeaveUsers = new Set();
+const freeChipsClaimLocks = new Set();
 const TURN_MS = 20000;
 const DISCONNECT_GRACE_MS = 12000;
+const FREE_CHIPS_AMOUNT = 1000;
+const FREE_CHIPS_COOLDOWN_MS = 4 * 60 * 60 * 1000;
 
 
 function makeDeck() {
@@ -840,6 +843,80 @@ async function ensureWallet(userId) {
   return created;
 }
 
+async function claimFreeChips(userId) {
+  if (freeChipsClaimLocks.has(userId)) {
+    return { ok: false, error: 'CLAIM_IN_PROGRESS' };
+  }
+
+  freeChipsClaimLocks.add(userId);
+  try {
+    const wallet = await ensureWallet(userId);
+    const now = Date.now();
+    const lastClaimMs = wallet.last_free_claim_at
+      ? new Date(wallet.last_free_claim_at).getTime()
+      : 0;
+    const nextClaimAt = lastClaimMs + FREE_CHIPS_COOLDOWN_MS;
+
+    if (lastClaimMs && now < nextClaimAt) {
+      return {
+        ok: false,
+        error: 'FREE_CHIPS_COOLDOWN',
+        wallet: Number(wallet.chips || 0),
+        lastFreeClaimAt: wallet.last_free_claim_at,
+        nextClaimAt: new Date(nextClaimAt).toISOString(),
+        serverNow: new Date(now).toISOString()
+      };
+    }
+
+    const claimedAt = new Date(now).toISOString();
+    const newBalance = Number(wallet.chips || 0) + FREE_CHIPS_AMOUNT;
+    let update = db.from('poker_wallets')
+      .update({
+        chips: newBalance,
+        last_free_claim_at: claimedAt,
+        updated_at: claimedAt
+      })
+      .eq('user_id', userId);
+
+    // Optimistic guard: only the process that read this exact claim timestamp
+    // may credit the wallet. This also protects against simultaneous tabs.
+    update = wallet.last_free_claim_at
+      ? update.eq('last_free_claim_at', wallet.last_free_claim_at)
+      : update.is('last_free_claim_at', null);
+
+    const { data: updated, error } = await update
+      .select('chips,last_free_claim_at')
+      .maybeSingle();
+    if (error) throw error;
+
+    if (!updated) {
+      const fresh = await ensureWallet(userId);
+      const freshLastMs = fresh.last_free_claim_at
+        ? new Date(fresh.last_free_claim_at).getTime()
+        : now;
+      return {
+        ok: false,
+        error: 'FREE_CHIPS_COOLDOWN',
+        wallet: Number(fresh.chips || 0),
+        lastFreeClaimAt: fresh.last_free_claim_at,
+        nextClaimAt: new Date(freshLastMs + FREE_CHIPS_COOLDOWN_MS).toISOString(),
+        serverNow: new Date().toISOString()
+      };
+    }
+
+    return {
+      ok: true,
+      amount: FREE_CHIPS_AMOUNT,
+      wallet: Number(updated.chips || 0),
+      lastFreeClaimAt: updated.last_free_claim_at,
+      nextClaimAt: new Date(now + FREE_CHIPS_COOLDOWN_MS).toISOString(),
+      serverNow: new Date(now).toISOString()
+    };
+  } finally {
+    freeChipsClaimLocks.delete(userId);
+  }
+}
+
 async function tableSnapshot(tableId) {
   const [{ data: table, error: te }, { data: seats, error: se }] = await Promise.all([
     db.from('poker_tables').select('*').eq('id', tableId).eq('enabled', true).single(),
@@ -925,9 +1002,18 @@ io.on('connection', async socket => {
         lobbySnapshot(),
         ensureWallet(user.id)
       ]);
-      ack({ ok: true, tables, wallet });
+      ack({ ok: true, tables, wallet, serverNow: new Date().toISOString() });
     } catch (error) {
       ack({ ok: false, error: error.message });
+    }
+  });
+
+  socket.on('poker:free-chips:claim', async (_, ack = () => {}) => {
+    try {
+      ack(await claimFreeChips(user.id));
+    } catch (error) {
+      console.error('ATR Poker free chips claim:', error);
+      ack({ ok: false, error: 'FREE_CHIPS_FAILED' });
     }
   });
 
