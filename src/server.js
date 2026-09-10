@@ -47,7 +47,10 @@ const handNoByTable = new Map();
 const startTimers = new Map();
 const turnTimers = new Map();
 const leaveAfterHandUsers = new Set();
+const disconnectTimers = new Map();
+const disconnectLeaveUsers = new Set();
 const TURN_MS = 20000;
+const DISCONNECT_GRACE_MS = 12000;
 
 
 function makeDeck() {
@@ -193,6 +196,80 @@ async function persistHandStacks(hand) {
   }
 }
 
+async function cashOutSeat(userId, expectedTableId = null) {
+  let query = db.from('poker_seats').delete().eq('user_id', userId);
+  if (expectedTableId) query = query.eq('table_id', expectedTableId);
+  const { data: seat, error: deleteError } = await query.select('*').maybeSingle();
+  if (deleteError) throw deleteError;
+  if (!seat) return { removed: false, wallet: null, tableId: expectedTableId };
+
+  try {
+    const wallet = await ensureWallet(userId);
+    const newBalance = Number(wallet.chips || 0) + Number(seat.stack || 0);
+    const { error: walletError } = await db.from('poker_wallets')
+      .update({ chips: newBalance, updated_at: new Date().toISOString() })
+      .eq('user_id', userId);
+    if (walletError) throw walletError;
+    return { removed: true, wallet: newBalance, tableId: seat.table_id, seat };
+  } catch (error) {
+    // Restore the claimed seat if crediting the wallet failed.
+    await db.from('poker_seats').insert(seat);
+    throw error;
+  }
+}
+
+async function publishTableDeparture(tableId) {
+  if (!tableId) return;
+  const fresh = await tableSnapshot(tableId);
+  io.to(TABLE_ROOM(tableId)).emit('poker:table:state', fresh);
+  io.emit('poker:lobby:changed');
+}
+
+async function foldDisconnectedPlayer(hand, userId) {
+  if (!hand || hand.completed) return;
+  const player = hand.players.find(p => p.userId === userId);
+  if (!player || player.folded || player.allIn) return;
+
+  if (player.seatNo === hand.turnSeatNo) {
+    await doServerAction(hand, userId, { type: 'fold' }, { fromTimer: true });
+    return;
+  }
+
+  player.folded = true;
+  hand.actedThisStreet.add(userId);
+  hand.lastAction = `SEAT ${player.seatNo} AUTO-FOLD (OFFLINE)`;
+  await persistHandStacks(hand);
+
+  if (livePlayers(hand).length === 1) {
+    await finishServerHand(hand, [livePlayers(hand)[0].userId], 'FOLD');
+  } else if (roundDone(hand)) {
+    await advanceServerStreet(hand);
+  } else {
+    emitHandState(hand);
+  }
+}
+
+async function removeDisconnectedPlayer(userId) {
+  if (userSockets.has(userId)) return;
+  const { data: seat, error } = await db.from('poker_seats')
+    .select('table_id,user_id').eq('user_id', userId).maybeSingle();
+  if (error) throw error;
+  if (!seat) return;
+
+  const hand = liveHands.get(seat.table_id);
+  if (hand && !hand.completed) {
+    disconnectLeaveUsers.add(userId);
+    leaveAfterHandUsers.add(userId);
+    await foldDisconnectedPlayer(hand, userId);
+    return;
+  }
+
+  const result = await cashOutSeat(userId, seat.table_id);
+  leaveAfterHandUsers.delete(userId);
+  disconnectLeaveUsers.delete(userId);
+  if (result.removed) await publishTableDeparture(seat.table_id);
+}
+
 async function abortLiveHand(tableId, { restoreStacks = true } = {}) {
   clearTurnTimer(tableId);
   const hand = liveHands.get(tableId);
@@ -233,6 +310,8 @@ async function startServerHand(tableId) {
   const table = snapshot.table;
   const eligible = snapshot.seats
     .filter(s => Number(s.stack) > 0)
+    .filter(s => userSockets.has(s.user_id))
+    .filter(s => !leaveAfterHandUsers.has(s.user_id))
     .sort((a,b)=>Number(a.seat_no)-Number(b.seat_no));
 
   if (eligible.length < 2) return false;
@@ -676,25 +755,13 @@ async function processLeaveAfterHand(tableId){
   if(!leaving.length)return false;
 
   for(const seat of leaving){
-    const {data:wallet,error:we}=await db.from('poker_wallets')
-      .select('chips').eq('user_id',seat.user_id).single();
-    if(we)throw we;
-
-    const newBalance=Number(wallet.chips||0)+Number(seat.stack||0);
-
-    const {error:uw}=await db.from('poker_wallets')
-      .update({chips:newBalance}).eq('user_id',seat.user_id);
-    if(uw)throw uw;
-
-    const {error:del}=await db.from('poker_seats')
-      .delete().eq('table_id',tableId).eq('user_id',seat.user_id);
-    if(del)throw del;
-
+    const result=await cashOutSeat(seat.user_id,tableId);
     leaveAfterHandUsers.delete(seat.user_id);
+    disconnectLeaveUsers.delete(seat.user_id);
 
     const socketId=userSockets.get(seat.user_id);
-    if(socketId){
-      io.to(socketId).emit('poker:table:left-after-hand',{wallet:newBalance});
+    if(socketId && result.removed){
+      io.to(socketId).emit('poker:table:left-after-hand',{wallet:result.wallet});
       const s=io.sockets.sockets.get(socketId);
       if(s){
         s.leave(TABLE_ROOM(tableId));
@@ -841,6 +908,13 @@ io.use(authenticateSocket);
 
 io.on('connection', async socket => {
   const user = socket.data.user;
+  const pendingDisconnect=disconnectTimers.get(user.id);
+  if(pendingDisconnect)clearTimeout(pendingDisconnect);
+  disconnectTimers.delete(user.id);
+  if(disconnectLeaveUsers.has(user.id)){
+    disconnectLeaveUsers.delete(user.id);
+    leaveAfterHandUsers.delete(user.id);
+  }
   userSockets.set(user.id, socket.id);
 
   socket.emit('poker:connected', { userId: user.id });
@@ -996,46 +1070,50 @@ io.on('connection', async socket => {
   });
 
   socket.on('poker:table:leave-after-hand', async (payload = {}, ack = () => {}) => {
-    const enabled=payload?.enabled!==false;
-    const userId=socket.data.user.id;
-    if(enabled)leaveAfterHandUsers.add(userId);
-    else leaveAfterHandUsers.delete(userId);
-    ack({ok:true,enabled});
+    try{
+      const enabled=payload?.enabled!==false;
+      const userId=socket.data.user.id;
+      const tableId=socket.data.tableId;
+      if(!tableId)return ack({ok:false,error:'NOT_SEATED'});
+
+      if(!enabled){
+        leaveAfterHandUsers.delete(userId);
+        return ack({ok:true,enabled:false});
+      }
+
+      leaveAfterHandUsers.add(userId);
+      const hand=liveHands.get(tableId);
+      if(hand && !hand.completed)return ack({ok:true,enabled:true,pending:true});
+
+      const result=await cashOutSeat(userId,tableId);
+      leaveAfterHandUsers.delete(userId);
+      disconnectLeaveUsers.delete(userId);
+      socket.leave(TABLE_ROOM(tableId));
+      socket.data.tableId=null;
+      if(result.removed)await publishTableDeparture(tableId);
+      ack({ok:true,enabled:true,pending:false,left:true,wallet:result.wallet});
+    }catch(error){
+      ack({ok:false,error:error.message||'LEAVE_AFTER_HAND_FAILED'});
+    }
   });
 
   socket.on('poker:table:leave', async (_, ack = () => {}) => {
     try {
       const currentTableId = socket.data.tableId;
       if (currentTableId && liveHands.has(currentTableId)) {
-        // V13.3 has no player-action phase yet. Restore posted blinds when
-        // somebody stands up so the deal test cannot burn play-money chips.
-        await abortLiveHand(currentTableId, { restoreStacks: true });
+        leaveAfterHandUsers.add(user.id);
+        await foldDisconnectedPlayer(liveHands.get(currentTableId),user.id);
+        return ack({ok:true,pending:true});
       }
 
-      const { data: seat, error } = await db.from('poker_seats')
-        .select('*').eq('user_id', user.id).maybeSingle();
-      if (error) throw error;
-      if (!seat) return ack({ ok: true });
-
-      const wallet = await ensureWallet(user.id);
-      const newBalance = Number(wallet.chips) + Number(seat.stack);
-
-      const { error: walletError } = await db.from('poker_wallets')
-        .update({ chips: newBalance, updated_at: new Date().toISOString() })
-        .eq('user_id', user.id);
-      if (walletError) throw walletError;
-
-      const { error: deleteError } = await db.from('poker_seats')
-        .delete().eq('user_id', user.id);
-      if (deleteError) throw deleteError;
-
-      socket.leave(TABLE_ROOM(seat.table_id));
+      const result=await cashOutSeat(user.id,currentTableId);
+      leaveAfterHandUsers.delete(user.id);
+      disconnectLeaveUsers.delete(user.id);
+      if(!result.removed)return ack({ok:true});
+      socket.leave(TABLE_ROOM(result.tableId));
       socket.data.tableId = null;
-
-      const fresh = await tableSnapshot(seat.table_id);
-      io.to(TABLE_ROOM(seat.table_id)).emit('poker:table:state', fresh);
-      io.emit('poker:lobby:changed');
-      ack({ ok: true, wallet: newBalance });
+      await publishTableDeparture(result.tableId);
+      ack({ ok: true, wallet: result.wallet });
     } catch (error) {
       ack({ ok: false, error: error.message });
     }
@@ -1089,14 +1167,46 @@ io.on('connection', async socket => {
   });
 
   socket.on('disconnect', () => {
-    userSockets.delete(user.id);
-    // Intentionally do NOT auto-cash-out on transient disconnect.
-    // Reconnect/resume logic is added with the authoritative game engine.
+    if(userSockets.get(user.id)===socket.id)userSockets.delete(user.id);
+    const previous=disconnectTimers.get(user.id);
+    if(previous)clearTimeout(previous);
+    const timer=setTimeout(async()=>{
+      disconnectTimers.delete(user.id);
+      try{
+        await removeDisconnectedPlayer(user.id);
+      }catch(error){
+        console.error('ATR Poker disconnect cleanup:',error);
+      }
+    },DISCONNECT_GRACE_MS);
+    disconnectTimers.set(user.id,timer);
   });
 });
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'atr-poker', phase: '1.6.5-3player-sidepot-beta' }));
+app.get('/health', (_, res) => res.json({ ok: true, service: 'atr-poker', phase: '1.6.6-offline-cleanup' }));
 
-server.listen(PORT, () => {
-  console.log(`ATR Poker backend listening on :${PORT}`);
+async function cleanupSeatsOnBoot(){
+  const {data:seats,error}=await db.from('poker_seats')
+    .select('user_id,table_id');
+  if(error)throw error;
+
+  let removed=0;
+  for(const seat of seats||[]){
+    const result=await cashOutSeat(seat.user_id,seat.table_id);
+    if(result.removed)removed+=1;
+  }
+  if(removed)console.log(`ATR Poker returned chips for ${removed} stale seat(s)`);
+}
+
+async function boot(){
+  // A server restart means every old socket is gone. Return those stacks before
+  // accepting new players, so a seat can never survive for days as a ghost.
+  await cleanupSeatsOnBoot();
+  server.listen(PORT, () => {
+    console.log(`ATR Poker backend listening on :${PORT}`);
+  });
+}
+
+boot().catch(error=>{
+  console.error('ATR Poker failed to start:',error);
+  process.exit(1);
 });
