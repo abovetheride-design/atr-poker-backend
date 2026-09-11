@@ -153,7 +153,18 @@ function armTurnTimer(hand){
       if(current.handNo!==expectedHandNo || current.turnSeatNo!==expectedSeat)return;
 
       const p=bySeat(current,expectedSeat);
-      if(!p || p.folded || p.allIn)return;
+      if(!p || p.folded || p.allIn){
+        const nextSeat=nextCanAct(current,expectedSeat);
+        if(nextSeat===null||nextSeat===undefined){
+          await advanceServerStreet(current);
+        }else{
+          current.turnSeatNo=nextSeat;
+          current.lastAction='SKIP INACTIVE SEAT';
+          armTurnTimer(current);
+          emitHandState(current);
+        }
+        return;
+      }
 
       const need=Math.max(0,current.currentBet-p.streetBet);
       current.lastAction=need>0
@@ -169,6 +180,14 @@ function armTurnTimer(hand){
 
       if(!result?.ok){
         console.error('ATR Poker timeout action rejected:',result);
+        const nextSeat=nextCanAct(current,expectedSeat);
+        if(nextSeat===null||nextSeat===undefined){
+          await advanceServerStreet(current);
+        }else{
+          current.turnSeatNo=nextSeat;
+          armTurnTimer(current);
+          emitHandState(current);
+        }
         return;
       }
 
@@ -742,7 +761,8 @@ async function doServerAction(hand,userId,payload,{fromTimer=false}={}){
 
   const nextSeat=nextCanAct(hand,p.seatNo);
   if(nextSeat===null||nextSeat===undefined){
-    return{ok:false,error:'NO_NEXT_ACTOR'};
+    const state=await advanceServerStreet(hand);
+    return{ok:true,state:state || handPublicState(hand)};
   }
 
   hand.turnSeatNo=nextSeat;
@@ -1268,7 +1288,7 @@ io.on('connection', async socket => {
   });
 });
 
-app.get('/health', (_, res) => res.json({ ok: true, service: 'atr-poker', phase: '1.6.6-offline-cleanup' }));
+app.get('/health', (_, res) => res.json({ ok: true, service: 'atr-poker', phase: '1.6.7-disconnect-watchdog' }));
 
 async function cleanupSeatsOnBoot(){
   const {data:seats,error}=await db.from('poker_seats')
